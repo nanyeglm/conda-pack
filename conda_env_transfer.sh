@@ -174,8 +174,32 @@ pack_environment() {
     # 使用完整路径调用conda-pack
     "${MINIFORGE_BASE}/bin/conda-pack" -n "$env_name" -o "$pack_file" --force >&2
     
+    # 验证打包文件完整性
+    print_info "验证打包文件完整性..." >&2
+    if ! gzip -t "$pack_file" 2>/dev/null; then
+        print_error "打包文件损坏，gzip 校验失败" >&2
+        rm -f "$pack_file"
+        echo "PACK_FAILED"
+        return 1
+    fi
+    
+    # 验证 tar 归档可读 (检查是否包含关键文件，忽略 conda-pack 可能产生的尾部空记录警告)
+    if ! tar -tzf "$pack_file" 2>/dev/null | grep -q "^bin/activate$"; then
+        print_error "打包文件损坏，缺少关键文件 bin/activate" >&2
+        rm -f "$pack_file"
+        echo "PACK_FAILED"
+        return 1
+    fi
+    print_success "文件完整性验证通过" >&2
+    
     local size=$(du -sh "$pack_file" | cut -f1)
     print_success "打包完成: ${pack_file} (${size})" >&2
+    
+    # 计算 MD5 校验和
+    local md5sum=$(md5sum "$pack_file" | awk '{print $1}')
+    echo "$md5sum" > "${pack_file}.md5"
+    print_info "MD5: ${md5sum}" >&2
+    
     echo "$pack_file"
 }
 
@@ -197,7 +221,18 @@ transfer_environment() {
         rsync -avz --progress -e "ssh" "$pack_file" "${USER}@${WORKSTATION_IP}:${TEMP_DIR}/"
     fi
     
-    print_success "传输完成"
+    # 验证传输完整性 (MD5校验)
+    local local_md5=$(cat "${pack_file}.md5" 2>/dev/null || md5sum "$pack_file" | awk '{print $1}')
+    print_info "验证传输完整性 (本地 MD5: ${local_md5})..."
+    local remote_md5=$(run_remote "$machine" "md5sum ${pack_file} | awk '{print \$1}'")
+    
+    if [[ "$local_md5" != "$remote_md5" ]]; then
+        print_error "传输校验失败！"
+        print_error "  本地 MD5: ${local_md5}"
+        print_error "  远程 MD5: ${remote_md5}"
+        exit 1
+    fi
+    print_success "传输校验通过 (MD5: ${remote_md5})"
 }
 
 install_remote_environment() {
@@ -220,9 +255,26 @@ install_remote_environment() {
         run_remote "$machine" "rm -rf ${target_dir}"
     fi
     
-    # 解压环境 (忽略非致命警告)
+    # 解压环境
     print_info "解压环境到: ${target_dir}"
-    run_remote "$machine" "mkdir -p ${target_dir} && tar -xzf ${pack_file} -C ${target_dir} --warning=no-unknown-keyword 2>/dev/null || tar -xzf ${pack_file} -C ${target_dir}"
+    
+    # 先验证远程文件完整性
+    print_info "验证远程文件完整性..."
+    if ! run_remote "$machine" "gzip -t ${pack_file}" 2>/dev/null; then
+        print_error "远程文件损坏，gzip 校验失败"
+        exit 1
+    fi
+    
+    # 解压 (忽略 tar 返回码，因为 conda-pack 可能产生尾部空记录导致非零返回码)
+    run_remote "$machine" "mkdir -p ${target_dir}"
+    run_remote "$machine" "tar -xzf ${pack_file} -C ${target_dir} --ignore-zeros 2>/dev/null || true"
+    
+    # 验证解压是否成功 (检查关键文件是否存在)
+    if ! run_remote "$machine" "test -f ${target_dir}/bin/activate && test -f ${target_dir}/bin/python"; then
+        print_error "解压失败: 关键文件不存在"
+        exit 1
+    fi
+    print_success "解压完成"
     
     # 修复路径
     print_info "修复环境路径..."
@@ -342,7 +394,13 @@ main() {
     print_header "开始传输"
     
     # 执行打包
-    local pack_file=$(pack_environment "$env_name")
+    local pack_file
+    pack_file=$(pack_environment "$env_name")
+    if [[ "$pack_file" == "PACK_FAILED" || -z "$pack_file" || ! -f "$pack_file" ]]; then
+        print_error "打包失败，请检查环境 ${env_name}"
+        print_info "建议尝试: conda install --force-reinstall -n ${env_name} <有问题的包>"
+        exit 1
+    fi
     echo ""
     
     # 传输
